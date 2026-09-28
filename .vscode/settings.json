@@ -1,0 +1,5 @@
+{
+    "terminal.integrated.env.windows": {
+        "PYTHONPYCACHEPREFIX": "${env:USERPROFILE}\\.pycache_local"
+    }
+}

@@ -1,0 +1,30 @@
+# --- Captura de pantalla ---
+mss==9.0.2                 # Mucho más rápido que pyautogui.screenshot()
+
+# --- Control de mouse ---
+pyautogui==0.9.54          # Simple y suficiente para hover/click
+# Alternativa si pyautogui da problemas de precisión/latencia: pynput==1.7.7
+
+# --- Visión por computadora ---
+opencv-python==4.10.0.84
+numpy==1.26.4
+scikit-image==0.24.0      
+Pillow==10.4.0
+
+# --- OCR ---
+pytesseract==0.3.13
+
+# --- Config / modelos ---
+pydantic==2.9.2            # Validación de settings y modelos tipados
+python-dotenv==1.0.1       # Variables de entorno (paths locales, flags de debug)
+pydantic-settings>=2.0.0
+
+# --- Testing ---
+pytest==8.3.3
+pytest-mock==3.14.0
+pytest-cov==5.0.0
+
+# --- Calidad de código ---
+black==24.10.0
+ruff==0.7.0
+mypy==1.13.0
