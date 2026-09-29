@@ -39,6 +39,10 @@ class Settings(BaseSettings):
         default=Path(r"C:\launcher"),
         description="Carpeta de instalación del launcher",
     )
+    launcher_exe_name: str = Field(
+        default="Launcher.exe",
+        description="Nombre del ejecutable del launcher, configurable desde .env",
+    )
     launcher_window_title: str = Field(
         default="launcher",
         description="Texto a buscar en el título de la ventana del launcher",

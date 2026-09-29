@@ -11,4 +11,7 @@ venv/
 reports/*
 !reports/.gitkeep
 
+# Configuración de entorno (no versionar, contiene datos sensibles)
 .env
+test_data/launcher_settings/**
+!test_data/launcher_settings/.gitkeep

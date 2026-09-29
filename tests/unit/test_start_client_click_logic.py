@@ -66,6 +66,68 @@ def test_wait_for_start_client_load_waits_for_the_minimum_game_load_time(monkeyp
     assert elapsed["time"] >= 34.0
 
 
+def test_main_skips_wait_when_launcher_never_started(monkeypatch, tmp_path):
+    calls = []
+
+    class DummyReport:
+        total = 1
+        passed_count = 0
+        failed_count = 0
+        error_count = 0
+        skipped_count = 0
+
+        def to_dict(self):
+            return {"status": "ok"}
+
+    object.__setattr__(main.settings, "launcher_dir", tmp_path / "missing_launcher")
+    object.__setattr__(main.settings, "reports_dir", tmp_path / "reports")
+    monkeypatch.setattr(main, "_resolve_languages", lambda codes: [SimpleNamespace(code="es")])
+    monkeypatch.setattr(main, "_write_report", lambda report, run_id: tmp_path / "report.json")
+    monkeypatch.setattr(main, "run_validation", lambda languages, capture_cropped=False: DummyReport())
+    monkeypatch.setattr(main, "_wait_for_start_client_load", lambda **kwargs: calls.append("wait") or True)
+    monkeypatch.setattr(main, "configure_logging", lambda: tmp_path / "logs" / "run.log")
+
+    result = main.main(["--language", "es"])
+
+    assert result == 0
+    assert calls == []
+
+
+def test_main_uses_launcher_exe_name_from_settings(monkeypatch, tmp_path):
+    exe_name = "CustomLauncher.exe"
+    exe_path = tmp_path / exe_name
+    exe_path.write_bytes(b"fake")
+
+    launched = {}
+
+    def fake_popen(cmd, cwd=None):
+        launched["cmd"] = cmd
+        launched["cwd"] = cwd
+        return SimpleNamespace(pid=123)
+
+    object.__setattr__(main.settings, "launcher_dir", tmp_path)
+    object.__setattr__(main.settings, "launcher_exe_name", exe_name)
+    object.__setattr__(main.settings, "reports_dir", tmp_path / "reports")
+    monkeypatch.setattr(main, "_resolve_languages", lambda codes: [SimpleNamespace(code="es")])
+    monkeypatch.setattr(main, "_write_report", lambda report, run_id: tmp_path / "report.json")
+    monkeypatch.setattr(main, "run_validation", lambda languages, capture_cropped=False: SimpleNamespace(total=1, passed_count=0, failed_count=0, error_count=0, skipped_count=0, to_dict=lambda: {"status": "ok"}))
+    monkeypatch.setattr(main, "configure_logging", lambda: tmp_path / "logs" / "run.log")
+    monkeypatch.setattr(main.subprocess, "Popen", fake_popen)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delitem(main.sys.modules, "pytest", raising=False)
+
+    result = main.main(["--language", "es"])
+
+    assert result == 0
+    assert launched["cmd"][0] == str(exe_path)
+
+
+def test_should_click_start_client_requires_detection_to_stabilize():
+    assert main._should_click_start_client(detected_at=100.0, now=100.0, min_stability_seconds=1.0) is False
+    assert main._should_click_start_client(detected_at=100.0, now=100.9, min_stability_seconds=1.0) is False
+    assert main._should_click_start_client(detected_at=100.0, now=101.0, min_stability_seconds=1.0) is True
+
+
 def test_get_locale_option_label_returns_the_listbox_value_for_supported_languages():
     assert _get_locale_option_label("en") == "English (en-us)"
     assert _get_locale_option_label("es") == "Español (es-es)"
@@ -123,8 +185,11 @@ def test_load_english_xml_config_uses_ctrl_o_and_language_path(monkeypatch, tmp_
         def keyUp(self, key):
             calls.append(("keyUp", key))
 
+    def fake_sleep(seconds):
+        calls.append(("sleep", seconds))
+
     monkeypatch.setattr(main, "_resolve_xml_config_path", lambda language_code=None: str(xml_path))
-    monkeypatch.setattr(main, "time", SimpleNamespace(sleep=lambda *_args, **_kwargs: None))
+    monkeypatch.setattr(main.time, "sleep", fake_sleep)
     monkeypatch.setattr("pyautogui.hotkey", _FakePyautogui().hotkey)
     monkeypatch.setattr("pyautogui.press", _FakePyautogui().press)
     monkeypatch.setattr("pyautogui.write", _FakePyautogui().write)
@@ -137,6 +202,7 @@ def test_load_english_xml_config_uses_ctrl_o_and_language_path(monkeypatch, tmp_
     assert ("hotkey", ("ctrl", "o")) in calls
     assert any(call[0] == "write" and str(xml_path) in call[1] for call in calls)
     assert ("press", "enter") in calls
+    assert ("sleep", 2.0) in calls
 
 
 def test_get_locale_scan_region_keeps_the_crop_tight_to_the_combo():
@@ -193,6 +259,50 @@ def test_find_locale_label_reference_uses_template_match(monkeypatch):
     assert region is not None
     assert region.left == 120
     assert region.top == 40
+
+
+def test_main_no_start_click_opens_launcher_and_loads_settings(monkeypatch, tmp_path):
+    calls = []
+    xml_path = tmp_path / "English.settings.xml"
+    xml_path.write_text("<config />", encoding="utf-8")
+
+    monkeypatch.setattr(main, "configure_logging", lambda: tmp_path / "run.log")
+    monkeypatch.setattr(main, "_find_launcher_hwnd", lambda: 42)
+    monkeypatch.setattr(main, "_resolve_languages", lambda codes: [SimpleNamespace(code="en", display_name="English")])
+    monkeypatch.setattr(main, "_resolve_xml_config_path", lambda language_code=None: str(xml_path))
+    monkeypatch.setattr(main.subprocess, "Popen", lambda *args, **kwargs: SimpleNamespace(pid=123))
+    monkeypatch.setattr(main, "_find_launcher_hwnd", lambda: 42)
+    monkeypatch.setattr(main, "load_english_xml_config", lambda hwnd=None, *, language_code=None: calls.append(("xml", hwnd, language_code)) or True)
+    monkeypatch.setattr(main, "run_validation", lambda *args, **kwargs: pytest.fail("run_validation should not execute when --no-start-click is set"))
+
+    exit_code = main.main(["--no-start-click"])
+
+    assert exit_code == 0
+    assert any(call[0] == "xml" and call[1] == 42 and call[2] == "en" for call in calls)
+
+
+def test_resolve_xml_config_path_finds_nested_variants(monkeypatch, tmp_path):
+    launcher_dir = tmp_path / "launcher" / "config"
+    xml_path = launcher_dir / "en" / "English.settings.xml"
+    xml_path.parent.mkdir(parents=True, exist_ok=True)
+    xml_path.write_text("<config />", encoding="utf-8")
+
+    monkeypatch.setattr(main, "settings", SimpleNamespace(test_data_dir=tmp_path, launcher_dir=tmp_path / "launcher", settings_fallback_dir=None), raising=False)
+    resolved = main._resolve_xml_config_path("en")
+
+    assert resolved == str(xml_path)
+
+
+def test_resolve_xml_config_path_prefers_project_launcher_settings(monkeypatch, tmp_path):
+    project_dir = tmp_path / "test_data" / "launcher_settings"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    project_xml = project_dir / "English.settings.xml"
+    project_xml.write_text("<config />", encoding="utf-8")
+
+    monkeypatch.setattr(main, "settings", SimpleNamespace(test_data_dir=tmp_path / "test_data", launcher_dir=tmp_path / "launcher", settings_fallback_dir=None), raising=False)
+    resolved = main._resolve_xml_config_path("en")
+
+    assert resolved == str(project_xml)
 
 
 def test_find_locale_label_reference_falls_back_to_bak_template(monkeypatch, tmp_path):

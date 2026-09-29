@@ -139,6 +139,18 @@ def _wait_for_start_client_load(
         time.sleep(sleep_for)
 
 
+def _should_click_start_client(
+    detected_at: float | None,
+    now: float,
+    *,
+    min_stability_seconds: float = 1.0,
+) -> bool:
+    """Devuelve True solo cuando el botón fue detectado de forma estable por al menos 1s."""
+    if detected_at is None:
+        return False
+    return (now - detected_at) >= min_stability_seconds
+
+
 def _should_skip_start_client_click(*, skip_start_click: bool = False) -> bool:
     """Responde si se debe omitir cualquier interacción de UI con 'Start Client'."""
     cli_override = bool(skip_start_click)
@@ -389,18 +401,89 @@ _XML_NAMES = {
 
 
 def _resolve_xml_config_path(language_code: str | None = None) -> str | None:
-    """Resuelve la ruta del XML de configuración del idioma usando la carpeta del juego como prioridad."""
-    key = (language_code or "en").strip().lower().replace("-", "_").split("_")[0]
-    names = _XML_NAMES.get(key, (f"{key.capitalize()}settings.xml",))
-    dirs = [settings.launcher_dir]
-    if settings.settings_fallback_dir:
-        dirs.append(settings.settings_fallback_dir)
+    """Resuelve la ruta del XML de configuración del idioma usando la carpeta del juego como prioridad.
 
+    La búsqueda es tolerante a nombres reales de launcher y ubicaciones anidadas:
+    - acepta variantes de mayúsculas y nombres con/ sin punto
+    - busca en la raíz y también recursivamente dentro del directorio del launcher
+    - admite archivos con nombres como `English.settings.xml`, `En.settings.xml`,
+      `en_settings.xml`, `config/language/en.xml`, etc.
+    """
+    import re
+
+    key = (language_code or "en").strip().lower().replace("-", "_").split("_")[0]
+    names = _XML_NAMES.get(key, (f"{key.capitalize()}settings.xml", f"{key.upper()}settings.xml"))
+    alias_tokens = {
+        "en": {"english", "en", "englishsettings", "ensettings"},
+        "es": {"spanish", "es", "spanishsettings", "essettings"},
+        "pt": {"portuguese", "pt", "portuguesesettings", "ptsettings"},
+    }
+    expected_tokens = alias_tokens.get(key, {key, f"{key}settings"})
+
+    def _normalize_name(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+    def _candidate_matches(path: Path) -> bool:
+        if not path.is_file() or path.suffix.lower() != ".xml":
+            return False
+        name = path.name
+        simple_name = _normalize_name(name)
+        if any(_normalize_name(candidate) in simple_name or simple_name in _normalize_name(candidate) for candidate in names):
+            return True
+        for token in expected_tokens:
+            if token in simple_name:
+                return True
+        if path.stem:
+            stem = _normalize_name(path.stem)
+            if any(token in stem for token in {"english", "spanish", "portuguese", "en", "es", "pt"}):
+                return True
+        return False
+
+    dirs = []
+    project_root = Path(__file__).resolve().parent
+    test_data_root = Path(getattr(settings, "test_data_dir", project_root / "test_data"))
+    project_launcher_settings = test_data_root / "launcher_settings"
+    for base in (
+        project_launcher_settings,
+        getattr(settings, "launcher_dir", None),
+        getattr(settings, "settings_fallback_dir", None),
+    ):
+        if base is not None:
+            dirs.append(Path(base))
+
+    # 1) Buscar primero en la raíz exacta de los directorios conocidos.
     for directory in dirs:
+        if not directory or not directory.exists():
+            continue
         for name in names:
             path = directory / name
             if path.exists():
                 return str(path)
+
+    # 2) Búsqueda recursiva para estructuras más complejas del juego/launcher.
+    for directory in dirs:
+        if not directory or not directory.exists():
+            continue
+        try:
+            for path in sorted(directory.rglob("*.xml"), key=lambda p: str(p).lower()):
+                if _candidate_matches(path):
+                    return str(path)
+        except Exception:
+            continue
+
+    # 3) Último recurso: intentar un nombre más genérico con el idioma objetivo.
+    for directory in dirs:
+        if not directory or not directory.exists():
+            continue
+        try:
+            for path in sorted(directory.rglob("*"), key=lambda p: str(p).lower()):
+                if path.is_file() and path.suffix.lower() in {".xml", ".config", ".ini", ".txt"}:
+                    text = path.name.lower()
+                    if any(token in text for token in (key, "settings")) and any(token in text for token in ("en", "es", "pt", "english", "spanish", "portuguese")):
+                        return str(path)
+        except Exception:
+            continue
+
     return None
 
 
@@ -419,18 +502,34 @@ def load_english_xml_config(hwnd: int | None = None, *, language_code: str | Non
 
         try:
             import win32gui
+            import win32con
         except Exception:
             win32gui = None
+            win32con = None
 
         if resolved_hwnd is not None and win32gui is not None:
-            logger.info("Trayendo la ventana del launcher al frente...")
-            win32gui.SetForegroundWindow(resolved_hwnd)
-            time.sleep(0.4)
+            logger.info("Trayendo la ventana del launcher al frente antes del Ctrl+O...")
+            try:
+                win32gui.ShowWindow(resolved_hwnd, win32con.SW_RESTORE)
+            except Exception:
+                pass
+            try:
+                win32gui.SetForegroundWindow(resolved_hwnd)
+            except Exception:
+                pass
+            time.sleep(0.8)
+            try:
+                for _ in range(10):
+                    if win32gui.GetForegroundWindow() == resolved_hwnd:
+                        break
+                    time.sleep(0.15)
+            except Exception:
+                pass
 
         pyautogui.keyUp("alt")
         logger.info("Abriendo diálogo de archivo con Ctrl+O y cargando la configuración XML...")
         pyautogui.hotkey("ctrl", "o")
-        time.sleep(0.8)
+        time.sleep(1.0)
 
         logger.info("Escribiendo ruta del archivo de settings: %s", xml_path)
         pyautogui.write(xml_path, interval=0.02)
@@ -438,7 +537,9 @@ def load_english_xml_config(hwnd: int | None = None, *, language_code: str | Non
 
         logger.info("Confirmando selección de archivo con Enter...")
         pyautogui.press("enter")
-        time.sleep(0.5)
+        # El launcher necesita un poco de tiempo para aceptar el XML y
+        # re-renderizar la UI antes de continuar con el arranque o el click.
+        time.sleep(2.0)
         logger.info("¡Configuración XML cargada exitosamente! (%s)", xml_path)
         return True
     except Exception as exc:
@@ -966,8 +1067,9 @@ def main(argv: list[str] | None = None) -> int:
         *,
         skip_start_click: bool = False,
         language_code: str | None = None,
-    ) -> None:
-        exe_path = settings.launcher_dir / "Launcher.exe"
+    ) -> bool:
+        exe_name = getattr(settings, "launcher_exe_name", "Launcher.exe")
+        exe_path = settings.launcher_dir / exe_name
 
         def _running_under_pytest() -> bool:
             try:
@@ -988,26 +1090,25 @@ def main(argv: list[str] | None = None) -> int:
 
         if _running_under_pytest():
             logger.info("Detected pytest runtime — skipping launcher launch/clicks.")
-            return
+            return False
         from src.utils.logger import get_logger as _get_logger
         log = _get_logger(__name__)
 
         skip_click = _should_skip_start_client_click(skip_start_click=skip_start_click)
         if skip_click:
             log.info(
-                "skip_click=True: omitiendo por completo la selección de idioma y el clic de 'Start Client'."
+                "skip_click=True: omitiendo la detección y clic de 'Start Client'; se abrirá el launcher y se continuará con la carga del XML de settings."
             )
-            return
-
+        
         if not exe_path.exists():
             log.info("No se encontró %s, omitiendo lanzamiento del juego.", exe_path)
-            return
+            return False
 
         try:
             proc = subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent))
         except Exception as exc:
             log.exception("Fallo al lanzar el launcher: %s", exc)
-            return
+            return False
 
         # Intentar traer la ventana del proceso al frente antes de interactuar
         def _bring_process_window_to_front(pid: int, wait_seconds: int = 10) -> int:
@@ -1149,6 +1250,10 @@ def main(argv: list[str] | None = None) -> int:
                     window_hwnd or _find_launcher_hwnd(),
                     language_code=language_code,
                 )
+                logger.info(
+                    "Launcher: archivo de settings cargado; esperando 2s para que el launcher aplique la configuración antes de continuar."
+                )
+                time.sleep(2.0)
             except Exception:
                 logger.exception("Error cargando configuración XML para '%s' antes del Start Client.", language_code)
 
@@ -1160,6 +1265,8 @@ def main(argv: list[str] | None = None) -> int:
         # tras cada captura usando `capturer._sct.monitors`.
         monitor_left = 0
         monitor_top = 0
+        start_client_seen_at: float | None = None
+        start_client_stability_seconds = 1.0
 
         while time.time() < deadline:
             try:
@@ -1276,7 +1383,30 @@ def main(argv: list[str] | None = None) -> int:
                         log.debug("OCR line %d: %r bbox=(%d,%d,%d,%d)", i, getattr(line, 'text', ''), getattr(line, 'left', 0), getattr(line, 'top', 0), getattr(line, 'right', 0), getattr(line, 'bottom', 0))
 
                 if result and "start client" in result.text.lower():
-                    log.info("Detectado 'Start Client' en pantalla.")
+                    now = time.monotonic()
+                    if start_client_seen_at is None:
+                        start_client_seen_at = now
+                        log.info(
+                            "Detectado 'Start Client' en pantalla; esperando %.1fs de estabilización antes del click.",
+                            start_client_stability_seconds,
+                        )
+                        time.sleep(0.2)
+                        continue
+
+                    if not _should_click_start_client(
+                        start_client_seen_at,
+                        now,
+                        min_stability_seconds=start_client_stability_seconds,
+                    ):
+                        log.debug(
+                            "Start Client detectado pero aún no estabilizó; transcurridos %.2fs de %.2fs.",
+                            now - start_client_seen_at,
+                            start_client_stability_seconds,
+                        )
+                        time.sleep(0.2)
+                        continue
+
+                    log.info("Detectado 'Start Client' estable; haciendo click.")
                     # buscar la línea exacta y clickear en su centro si es posible
                     button_line = None
                     for line in result.lines:
@@ -1296,7 +1426,10 @@ def main(argv: list[str] | None = None) -> int:
                         log.debug("Click offset=(%d,%d) -> click target=(%d,%d)", offset_left, offset_top, x, y)
                         try:
                             import pyautogui
-                            time.sleep(0.5)
+                            # Esperar 1s mínimo tras estabilizar la detección para
+                            # evitar clics prematuros sobre una UI que aún se está
+                            # recalculando.
+                            time.sleep(1.0)
                             # Asegurar que el click quede dentro de la pantalla virtual
                             try:
                                 virt = capturer._sct.monitors[0]
@@ -1352,7 +1485,7 @@ def main(argv: list[str] | None = None) -> int:
                                         # consideramos la UI lista.
                                         if mean > 10.0:
                                             log.info("Launcher: UI lista detectada en área del botón siguiente.")
-                                            return
+                                            return True
                                     except Exception:
                                         # Si cv2 falla sobre la región, ignorar y repetir.
                                         log.exception("Error procesando región para readiness check.")
@@ -1363,9 +1496,12 @@ def main(argv: list[str] | None = None) -> int:
                             log.warning("Launcher: UI no detectada tras esperar %ds", timeout_ready)
                         except Exception:
                             log.exception("Error al hacer click en 'Start Client'.")
-                    return
+                    return True
             except Exception:
                 log.exception("Error durante detección de 'Start Client'.")
+
+            if not result or "start client" not in result.text.lower():
+                start_client_seen_at = None
 
             time.sleep(poll_interval)
 
@@ -1446,6 +1582,7 @@ def main(argv: list[str] | None = None) -> int:
                 log.exception("Template fallback: error durante matching.")
 
         log.warning("No se detectó 'Start Client' tras esperar %ds", timeout)
+        return False
 
     languages = _resolve_languages(args.language)
     selected_language = languages[0].code if languages else "en"
@@ -1462,19 +1599,39 @@ def main(argv: list[str] | None = None) -> int:
             logger.exception("--click-locale-only: error during XML config load.")
             return 1
 
-    # Ejecutar el lanzamiento del juego antes de la validación
+    if getattr(args, 'no_start_click', False):
+        logger.info("--no-start-click: abriendo el launcher y cargando la configuración del XML sin ejecutar la validación de idiomas.")
+        try:
+            launch_launcher(
+                skip_start_click=True,
+                language_code=selected_language,
+            )
+            time.sleep(2.0)
+            hwnd = _find_launcher_hwnd()
+            ok = load_english_xml_config(hwnd, language_code=selected_language)
+            logger.info("--no-start-click result=%s", ok)
+            return 0 if ok else 1
+        except Exception:
+            logger.exception("--no-start-click: error durante la carga de configuración del launcher.")
+            return 1
+
+    # Ejecutar el lanzamiento del juego antes de la validación. El wait mínimo
+    # solo debe dispararse cuando el launcher realmente arrancó y se hizo el
+    # click de 'Start Client'; si no se lanzó, no se debe iniciar el scroll.
     try:
-        launch_launcher(
-            skip_start_click=getattr(args, 'no_start_click', False),
+        launcher_started = launch_launcher(
+            skip_start_click=False,
             language_code=selected_language,
         )
-
-        try:
-            from src.config.settings import settings as _settings
-            if getattr(_settings, 'launcher_click_start_client', True):
-                _wait_for_start_client_load()
-        except Exception:
-            logger.exception("Error esperando a que el launcher termine de abrir.")
+        if not launcher_started:
+            logger.info("Launcher: no se inició; se salta el wait de carga y se continua con el scroll de validación.")
+        else:
+            try:
+                from src.config.settings import settings as _settings
+                if getattr(_settings, 'launcher_click_start_client', True):
+                    _wait_for_start_client_load()
+            except Exception:
+                logger.exception("Error esperando a que el launcher termine de abrir.")
     except Exception:
         logger.exception("Error al intentar lanzar el launcher.")
 

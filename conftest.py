@@ -102,7 +102,8 @@ def launch_launcher():
     """
     from src.config.settings import settings as _settings
 
-    exe_path = _settings.launcher_dir / "Launcher.exe"
+    exe_name = getattr(_settings, "launcher_exe_name", "Launcher.exe")
+    exe_path = _settings.launcher_dir / exe_name
     logger = get_logger(__name__)
 
     if not exe_path.exists():
